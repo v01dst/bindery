@@ -2261,3 +2261,43 @@ func TestSetShareLimits_HTTPError(t *testing.T) {
 		t.Fatal("expected error on HTTP 500")
 	}
 }
+
+// TestAddTorrent_TruncatedBodyIsNotSuccess pins the hazard that accepting an
+// empty body creates (#2304). An empty body from the SERVER is the emulator
+// case and is a legitimate accept. An empty body because Bindery could not
+// finish reading is not: qBittorrent may well have written "Fails." into a
+// response that was cut off in transit, and treating that as success would
+// report a grab that never happened against a hash the client will never hold.
+func TestAddTorrent_TruncatedBodyIsNotSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/add":
+			// Promise a body, then hang up before writing it, so io.ReadAll
+			// returns an unexpected EOF with no bytes.
+			w.Header().Set("Content-Length", "6")
+			w.WriteHeader(http.StatusOK)
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("test server does not support hijacking")
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, "admin", "pass")
+	c.loggedIn = true
+
+	if _, err := c.AddTorrent(context.Background(),
+		"magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c", "bindery", ""); err == nil {
+		t.Fatal("a truncated response body was accepted as a successful add")
+	} else if !strings.Contains(err.Error(), "read response") {
+		t.Errorf("error = %q, want it to name the read failure", err)
+	}
+}

@@ -371,7 +371,17 @@ func (c *Client) AddTorrent(ctx context.Context, magnetOrURL, category, savePath
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	// The read error matters here in a way it does not at the other call sites
+	// in this file. Below, an empty body on a 200 is an ACCEPT (the emulator
+	// case, #2304), so a truncated read would be promoted to success: a
+	// connection reset after the headers but before qBittorrent's "Fails."
+	// arrives would report a grab that never happened, against a hash the
+	// client will never hold. The other readers treat empty as a non-match and
+	// fail closed, which is why they can keep discarding it.
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if readErr != nil {
+		return "", fmt.Errorf("add torrent: read response: %w", readErr)
+	}
 	text := strings.TrimSpace(string(body))
 
 	// qBittorrent answers POST /torrents/add with 409 Conflict when it already
