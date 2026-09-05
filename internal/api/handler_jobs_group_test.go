@@ -136,6 +136,60 @@ func TestManualImportBatch_ShutDownGroupIsRefused(t *testing.T) {
 	}
 }
 
+// TestManualImportReassign_ShutDownGroupIsRefused pins the same answer for the
+// reassign endpoint (#2372). Reassign has already detached the file from the
+// source book by the time it launches the move, so answering 202 for a move
+// that never happens would leave the file attached to nothing.
+func TestManualImportReassign_ShutDownGroupIsRefused(t *testing.T) {
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	ctx := context.Background()
+	authors := db.NewAuthorRepo(database)
+	books := db.NewBookRepo(database)
+
+	src := seedBook(t, authors, books, ctx)
+	target := &models.Book{
+		ForeignID: "mi-book-shutdown", AuthorID: src.AuthorID,
+		Title: "Correct Book", SortTitle: "correct book",
+		Status: "wanted", Genres: []string{},
+		MetadataProvider: "openlibrary", Monitored: true,
+	}
+	if err := books.Create(ctx, target); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	epub := filepath.Join(t.TempDir(), "mismatched.epub")
+	writeTestFile(t, epub)
+	if err := books.AddBookFile(ctx, src.ID, models.MediaTypeEbook, epub); err != nil {
+		t.Fatalf("attach file to source: %v", err)
+	}
+
+	scanner := &stubManualImportScanner{}
+	group := jobs.NewGroup(context.Background())
+	group.Shutdown(time.Second)
+	h := NewManualImportHandler(scanner, db.NewDownloadRepo(database), books).WithJobs(group)
+
+	body, err := json.Marshal(map[string]any{
+		"path": epub, "targetBookId": target.ID, "format": models.MediaTypeEbook,
+	})
+	if err != nil {
+		t.Fatalf("marshal reassign: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	h.Reassign(rec, httptest.NewRequest(http.MethodPost, "/api/v1/queue/manual-import/reassign", bytes.NewReader(body)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 while shutting down; body = %s", rec.Code, rec.Body.String())
+	}
+	scanner.importMu.Lock()
+	calls := scanner.importCalls
+	scanner.importMu.Unlock()
+	if calls != 0 {
+		t.Errorf("ImportFromPath ran %d times for a refused reassign", calls)
+	}
+}
+
 // TestFetchAuthorBooksAsync_RoutesThroughTheJobsGroup covers the author side of
 // #2371. A calibre-prefixed author on a single-work run returns immediately
 // inside fetchAuthorBooks, which keeps the assertion about the launch rather
