@@ -12,8 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
-
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/httpsec"
 	"github.com/vavallee/bindery/internal/models"
@@ -612,10 +610,7 @@ func TestDownloadClientHandlers_NonNumericID(t *testing.T) {
 			}
 
 			rec := httptest.NewRecorder()
-			req := httptest.NewRequest(tc.method, "/downloadclient/abc", bytes.NewBufferString(`{}`))
-			rctx := chi.NewRouteContext()
-			rctx.URLParams.Add("id", "abc")
-			req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+			req := withURLParam(httptest.NewRequest(tc.method, "/downloadclient/abc", bytes.NewBufferString(`{}`)), "id", "abc")
 
 			tc.call(h, rec, req)
 

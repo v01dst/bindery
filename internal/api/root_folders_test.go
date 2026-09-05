@@ -2,14 +2,11 @@ package api
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
-
-	"github.com/go-chi/chi/v5"
 
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/models"
@@ -130,10 +127,7 @@ func TestRootFolderDelete_NonNumericID(t *testing.T) {
 	h := rootFolderFixture(t)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodDelete, "/rootfolder/abc", nil)
-	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("id", "abc")
-	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req := withURLParam(httptest.NewRequest(http.MethodDelete, "/rootfolder/abc", nil), "id", "abc")
 
 	h.Delete(rec, req)
 
