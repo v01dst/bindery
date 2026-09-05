@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -279,11 +280,35 @@ func TestCheckStalledDownloads_QBitNoStalls(t *testing.T) {
 	}
 }
 
+// stallDeleteRecorder captures the /api/v2/torrents/delete calls a fake
+// qBittorrent receives, so a test can assert the stall handler actually removed
+// the torrent it says it removed (#2367).
+type stallDeleteRecorder struct {
+	mu     sync.Mutex
+	hashes []string
+	files  []string
+}
+
+func (r *stallDeleteRecorder) record(req *http.Request) {
+	_ = req.ParseForm()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hashes = append(r.hashes, req.PostFormValue("hashes"))
+	r.files = append(r.files, req.PostFormValue("deleteFiles"))
+}
+
+func (r *stallDeleteRecorder) calls() ([]string, []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.hashes...), append([]string(nil), r.files...)
+}
+
 // TestCheckStalledDownloads_QBitStalledTorrent walks the full path: qBit
 // reports a stalledDL torrent whose hash matches an old download, so
-// handleStalledDownload fires: download is marked failed, blocklisted, and
-// a history event is recorded.
+// handleStalledDownload fires: the torrent is removed from the client, the
+// download is marked failed, blocklisted, and a history event is recorded.
 func TestCheckStalledDownloads_QBitStalledTorrent(t *testing.T) {
+	deletes := &stallDeleteRecorder{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v2/auth/login":
@@ -293,8 +318,10 @@ func TestCheckStalledDownloads_QBitStalledTorrent(t *testing.T) {
 				"hash":  "DEADBEEF",
 				"state": "stalledDL",
 			}})
+		case "/api/v2/torrents/delete":
+			deletes.record(r)
 		default:
-			t.Fatalf("unexpected path: %s", r.URL.Path)
+			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 	}))
 	defer srv.Close()
@@ -375,6 +402,17 @@ func TestCheckStalledDownloads_QBitStalledTorrent(t *testing.T) {
 		searcher:  indexer.NewSearcher(),
 	}
 	s.checkStalledDownloads(ctx)
+
+	hashes, files := deletes.calls()
+	if len(hashes) != 1 {
+		t.Fatalf("expected 1 torrent delete call on the client, got %d", len(hashes))
+	}
+	if hashes[0] != tid {
+		t.Errorf("deleted torrent hash: want %q, got %q", tid, hashes[0])
+	}
+	if files[0] != "true" {
+		t.Errorf("deleteFiles: want %q, got %q", "true", files[0])
+	}
 
 	got, err := downloadsRepo.GetByGUID(ctx, "g-stalled")
 	if err != nil {
@@ -464,7 +502,7 @@ func TestHandleStalledDownload_NoHistoryRepo(t *testing.T) {
 		blocklist: blocklistRepo,
 		settings:  db.NewSettingsRepo(database),
 	}
-	s.handleStalledDownload(ctx, dl)
+	s.handleStalledDownload(ctx, dl, nil)
 
 	got, _ := downloadsRepo.GetByGUID(ctx, "g-nb")
 	if got.Status != models.DownloadStatusFailed {
@@ -499,5 +537,5 @@ func TestHandleStalledDownload_NilBlocklistRepo(t *testing.T) {
 		downloads: downloadsRepo,
 		settings:  db.NewSettingsRepo(database),
 	}
-	s.handleStalledDownload(ctx, dl)
+	s.handleStalledDownload(ctx, dl, nil)
 }
