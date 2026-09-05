@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { useConfirmDialog } from '../components/useConfirmDialog'
 import { api, Book, PendingRelease, QueueItem } from '../api/client'
 import BookAuthorLink from '../components/BookAuthorLink'
 import ImportHints from '../components/ImportHints'
@@ -10,6 +11,7 @@ import { btn, btnSize } from '../components/buttons'
 
 export default function QueuePage() {
   const { t } = useTranslation()
+  const { confirm, confirmDialog } = useConfirmDialog()
   const [queue, setQueue] = useState<QueueItem[]>([])
   const [pending, setPending] = useState<PendingRelease[]>([])
   const [loading, setLoading] = useState(true)
@@ -231,7 +233,12 @@ export default function QueuePage() {
   // per-item endpoints (no new API). Retry only applies to importFailed.
   const [bulkBusy, setBulkBusy] = useState(false)
   const clearAllFailed = async () => {
-    if (failedItems.length === 0 || !confirm(t('queue.clearAllConfirm', { count: failedItems.length, defaultValue: 'Remove {{count}} failed item(s) from the queue?' }))) return
+    if (failedItems.length === 0) return
+    if (!await confirm({
+      title: t('common.confirmTitle'),
+      body: t('queue.clearAllConfirm', { count: failedItems.length, defaultValue: 'Remove {{count}} failed item(s) from the queue?' }),
+      confirmLabel: t('common.remove'),
+    })) return
     setBulkBusy(true)
     try {
       await Promise.all(failedItems.map(it => api.deleteFromQueue(it.id, false).catch(() => {})))
@@ -257,7 +264,11 @@ export default function QueuePage() {
   // immediately re-grab them — the recovery path for an accidental mass import.
   const removeSelected = async () => {
     if (selectedIds.size === 0) return
-    if (!confirm(t('queue.removeSelectedConfirm', { count: selectedIds.size, defaultValue: 'Remove {{count}} item(s) from the queue?' }))) return
+    if (!await confirm({
+      title: t('common.confirmTitle'),
+      body: t('queue.removeSelectedConfirm', { count: selectedIds.size, defaultValue: 'Remove {{count}} item(s) from the queue?' }),
+      confirmLabel: t('common.remove'),
+    })) return
     setBulkBusy(true)
     setBulkResult(null)
     try {
@@ -317,6 +328,7 @@ export default function QueuePage() {
 
   return (
     <div>
+      {confirmDialog}
       <h2 className="text-2xl font-bold mb-6">{t('queue.title')}</h2>
 
       {loading ? (
