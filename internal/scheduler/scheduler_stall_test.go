@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -538,4 +539,109 @@ func TestHandleStalledDownload_NilBlocklistRepo(t *testing.T) {
 		settings:  db.NewSettingsRepo(database),
 	}
 	s.handleStalledDownload(ctx, dl, nil)
+}
+
+// TestCheckStalledDownloads_RemovalFailureStillRecovers pins the fallback in
+// removeStalledFromClient (#2367): the client refusing the delete must not cost
+// the user the recovery. The row is still failed, the release is still
+// blocklisted, and the stall history event is still written.
+func TestCheckStalledDownloads_RemovalFailureStillRecovers(t *testing.T) {
+	var deleteCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			_, _ = w.Write([]byte("Ok."))
+		case "/api/v2/torrents/info":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"hash":  "BADDELETE",
+				"state": "stalledDL",
+			}})
+		case "/api/v2/torrents/delete":
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	host, port := stallServerHostPort(t, srv.URL)
+
+	database, err := db.OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+
+	clientsRepo := db.NewDownloadClientRepo(database)
+	client := &models.DownloadClient{
+		Name: "qb", Type: "qbittorrent", Host: host, Port: port,
+		Username: "u", Password: "p", Enabled: true,
+	}
+	if err := clientsRepo.Create(ctx, client); err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+
+	indexersRepo := db.NewIndexerRepo(database)
+	idx := &models.Indexer{Name: "mock", Type: "newznab", URL: "http://x", APIKey: "k", Enabled: true, Priority: 25}
+	if err := indexersRepo.Create(ctx, idx); err != nil {
+		t.Fatalf("create indexer: %v", err)
+	}
+
+	downloadsRepo := db.NewDownloadRepo(database)
+	tid := strings.ToLower("BADDELETE")
+	dl := &models.Download{
+		GUID: "g-baddelete", Title: "Undeletable Release",
+		IndexerID: &idx.ID, DownloadClientID: &client.ID,
+		Status: models.StateGrabbed, Protocol: "torrent",
+		TorrentID: &tid,
+	}
+	if err := downloadsRepo.Create(ctx, dl); err != nil {
+		t.Fatalf("create download: %v", err)
+	}
+	old := time.Now().UTC().Add(-3 * time.Hour)
+	if _, err := database.ExecContext(ctx,
+		"UPDATE downloads SET status=?, grabbed_at=? WHERE id=?",
+		models.DownloadStatusDownloading, old, dl.ID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+
+	blocklistRepo := db.NewBlocklistRepo(database)
+	historyRepo := db.NewHistoryRepo(database)
+	s := &Scheduler{
+		downloads: downloadsRepo,
+		clients:   clientsRepo,
+		indexers:  indexersRepo,
+		settings:  db.NewSettingsRepo(database),
+		blocklist: blocklistRepo,
+		history:   historyRepo,
+	}
+	s.checkStalledDownloads(ctx)
+
+	if n := deleteCalls.Load(); n != 1 {
+		t.Fatalf("expected 1 delete attempt, got %d", n)
+	}
+	got, err := downloadsRepo.GetByGUID(ctx, "g-baddelete")
+	if err != nil {
+		t.Fatalf("GetByGUID: %v", err)
+	}
+	if got.Status != models.DownloadStatusFailed {
+		t.Errorf("download status after a refused delete: want %q, got %q",
+			models.DownloadStatusFailed, got.Status)
+	}
+	blocked, err := blocklistRepo.IsBlocked(ctx, "g-baddelete")
+	if err != nil {
+		t.Fatalf("IsBlocked: %v", err)
+	}
+	if !blocked {
+		t.Error("a refused delete skipped the blocklist, so the same release can be re-grabbed")
+	}
+	events, err := historyRepo.ListByType(ctx, models.HistoryEventDownloadStalled)
+	if err != nil {
+		t.Fatalf("ListByType: %v", err)
+	}
+	if len(events) != 1 {
+		t.Errorf("expected 1 downloadStalled history event, got %d", len(events))
+	}
 }
